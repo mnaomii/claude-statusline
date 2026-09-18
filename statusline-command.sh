@@ -1,6 +1,7 @@
 #!/bin/bash
 # Claude Code status line
-# Shows: repo name | 5h usage (RGB gradient) | context used (RGB gradient) | model | session tokens
+# Shows: repo name | 5h usage (RGB gradient) | time until the 5h window resets (RGB
+# gradient) | context used (RGB gradient) | model | session tokens
 # Separators are printed in dim gray.
 
 input=$(cat)
@@ -15,6 +16,7 @@ model=$(printf '%s' "$input" | jq -r '.model.display_name')
 effort=$(printf '%s' "$input" | jq -r '.effort.level // empty')
 
 five_hour=$(printf '%s' "$input" | jq -r '.rate_limits.five_hour.used_percentage // empty')
+five_hour_resets_at=$(printf '%s' "$input" | jq -r '.rate_limits.five_hour.resets_at // empty')
 context_used=$(printf '%s' "$input" | jq -r '.context_window.used_percentage // empty')
 
 tokens_in=$(printf '%s' "$input" | jq -r '.context_window.total_input_tokens // 0')
@@ -35,6 +37,9 @@ RESET="\033[0m"
 DIM_GRAY="\033[38;5;240m"
 SEP="${DIM_GRAY} | ${RESET}"
 BAR_WIDTH=10
+# Length of the rolling rate-limit window, used to turn "seconds until reset" into a
+# fill percentage for the reset bar.
+WINDOW_SECONDS=18000
 
 # Builds a fixed-width bar of block characters. Each block's color is
 # interpolated along a green -> yellow -> red gradient based on its position,
@@ -70,12 +75,39 @@ gradient_bar() {
   printf '%s' "$out"
 }
 
+# Formats a number of seconds as a compact countdown: 4h58m, 47m, <1m.
+format_remaining() {
+  awk -v s="$1" 'BEGIN{
+    if (s < 0) s = 0
+    h = int(s / 3600)
+    m = int((s % 3600) / 60)
+    if (h > 0) printf "%dh%02dm", h, m
+    else if (m > 0) printf "%dm", m
+    else printf "<1m"
+  }'
+}
+
 parts=("$repo_name")
 
 if [ -n "$five_hour" ]; then
   bar=$(gradient_bar "$five_hour")
   pct=$(awk -v p="$five_hour" 'BEGIN{printf "%.0f", p}')
   parts+=("${DIM_GRAY}5h${RESET} ${bar} ${pct}%")
+fi
+
+# The reset bar is a clock, not a gauge: it fills as the 5h window elapses, so a full
+# bar means the reset is imminent. Elapsed time is derived from how much of the window
+# is still left, since the payload gives the reset instant rather than the start.
+if [[ "$five_hour_resets_at" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+  remaining=$(awk -v r="$five_hour_resets_at" -v n="$(date +%s)" -v w="$WINDOW_SECONDS" 'BEGIN{
+    s = r - n
+    if (s < 0) s = 0
+    if (s > w) s = w
+    printf "%d", s
+  }')
+  elapsed_pct=$(awk -v s="$remaining" -v w="$WINDOW_SECONDS" 'BEGIN{printf "%.4f", 100 * (w - s) / w}')
+  bar=$(gradient_bar "$elapsed_pct")
+  parts+=("${DIM_GRAY}reset${RESET} ${bar} $(format_remaining "$remaining")")
 fi
 
 if [ -n "$context_used" ]; then
